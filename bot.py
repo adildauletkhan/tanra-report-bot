@@ -416,13 +416,16 @@ async def process_report(
 
     try:
         structured = await _structure_transcript(session, transcript)
-    except Exception:
-        logger.exception("LLM structuring failed")
-        await message.answer(
-            "Речь распознана, но не удалось сформировать черновик. Попробуйте ещё раз."
-        )
-        await state.clear()
-        return
+    except Exception as exc:
+        # llm_claude.structure сам ловит API-ошибки; сюда попадаем редко.
+        logger.exception("LLM structuring failed: %s", exc)
+        structured = {
+            "entries": [],
+            "needs_clarification": [
+                {"reason": f"structure_exception:{type(exc).__name__}", "raw_fragment": transcript[:200]}
+            ],
+            "summary_line": f"Распознано (черновик без структуры):\n{transcript.strip()[:500]}",
+        }
 
     report = VoiceReportLog(
         report_id=f"r-{datetime.utcnow().timestamp()}",
@@ -438,9 +441,9 @@ async def process_report(
     needs_clarification = structured.get("needs_clarification") or []
     clarification_note = ""
     if needs_clarification:
-        clarification_note = "\n\n⚠ Требует уточнения: " + "; ".join(
-            str(item.get("reason", "")) for item in needs_clarification
-        )
+        reasons = "; ".join(str(item.get("reason", "")) for item in needs_clarification if item.get("reason"))
+        if reasons:
+            clarification_note = f"\n\n⚠ Требует уточнения: {reasons}"
 
     await message.answer(
         f"📋 Черновик отчёта:\n{draft_text}{clarification_note}\n\nВсё верно?",
