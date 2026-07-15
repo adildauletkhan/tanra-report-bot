@@ -28,10 +28,15 @@ from aiogram.types import (
     Message,
 )
 
+from asr_yandex import ensure_config as ensure_yandex_config
+from asr_yandex import transcribe as asr_transcribe
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+# Проверяем переменные Yandex SpeechKit на старте (аналогично TELEGRAM_BOT_TOKEN).
+ensure_yandex_config()
 
 # --------------------------------------------------------------------------
 # "База" объектов — в проде это должен быть запрос к backend API платформы
@@ -225,6 +230,14 @@ async def process_report(
     await message.answer("⏳ Обрабатываю...")
 
     transcript = await asr_transcribe(audio_path, language_hint="mixed")
+    if not transcript.strip():
+        # Тишина/шум — ASR вернул пустую строку. Не вызываем llm_structure.
+        await message.answer(
+            "Не удалось распознать речь, попробуйте ещё раз в тихом месте."
+        )
+        await state.clear()
+        return
+
     structured = await llm_structure(
         transcript=transcript,
         project_id=user.default_project_id,
@@ -420,14 +433,8 @@ async def handle_correction_text(message: Message, state: FSMContext) -> None:
 
 # --------------------------------------------------------------------------
 # Заглушки внешних сервисов — заменить на реальную интеграцию
+# (asr_transcribe теперь реализован в asr_yandex.py и импортирован выше)
 # --------------------------------------------------------------------------
-
-
-async def asr_transcribe(audio_path: str, language_hint: str = "mixed") -> str:
-    """
-    TODO: заменить на реальный вызов ASR (Whisper self-host / провайдер с kk-KZ).
-    """
-    raise NotImplementedError("Подключите ASR-сервис (см. telegram-bot-tech-spec.md, §3)")
 
 
 async def llm_structure(
