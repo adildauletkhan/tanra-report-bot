@@ -9,15 +9,13 @@ ASR через Yandex SpeechKit — AsyncRecognizer, API v3 REST (регион �
 
     from asr_yandex import transcribe as asr_transcribe
 
-Поток работы (см. https://yandex.cloud/ru-kz/docs/speechkit/stt-v3):
-    1. POST /stt/v3/recognizeFileAsync — отправляем аудио (inline base64) и получаем
-       operation_id (Long Running Operation).
-    2. Опрашиваем GET {STT}/operations/{id} до done=true (_poll_operation).
-       Важно: для SpeechKit KZ операции живут на том же хосте STT
-       (stt.api.ml.yandexcloud.kz), а не на operation.api.* — тот хост
-       в регионе KZ не резолвится.
-    3. GET /stt/v3/getRecognition?operationId=... — забираем результат (поток
-       StreamingResponse-объектов) и склеиваем транскрипт.
+Поток работы (туториал KZ API v3):
+    1. POST /stt/v3/recognizeFileAsync — аудио (inline base64) → operation id.
+    2. Повторяем GET /stt/v3/getRecognition?operationId=... пока результат
+       не готов (404/«not ready» → sleep и retry). Отдельный Operation API
+       (GET /operations/{id}) для SpeechKit KZ отдаёт 404 на реальные id —
+       его не используем.
+    3. Разбираем поток StreamingResponse → транскрипт.
 
 Автоопределение языка (ru/kk и смешанные фразы) включается через
 languageRestriction = WHITELIST + ["auto"] — SpeechKit определяет язык по каждому
@@ -54,17 +52,13 @@ YANDEX_FOLDER_ID = os.environ.get("YANDEX_FOLDER_ID")
 STT_SERVICE_URL = os.environ.get(
     "YANDEX_STT_SERVICE_URL", "https://stt.api.ml.yandexcloud.kz"
 ).rstrip("/")
-# REST Operation.Get: GET https://stt.api.ml.yandexcloud.kz/operations/{operationId}
-# Хост operation.api.ml.yandexcloud.kz в KZ не резолвится — игнорируем, если задан.
-_op_override = os.environ.get("YANDEX_OPERATION_SERVICE_URL", "").rstrip("/")
-if _op_override and "operation.api.ml.yandexcloud.kz" not in _op_override:
-    OPERATION_SERVICE_URL = _op_override
-else:
-    OPERATION_SERVICE_URL = STT_SERVICE_URL
 
-# Параметры опроса операции распознавания.
-ASR_POLL_TIMEOUT_SECONDS = float(os.environ.get("ASR_POLL_TIMEOUT_SECONDS", "60"))
+# Параметры опроса getRecognition до готовности результата.
+ASR_POLL_TIMEOUT_SECONDS = float(os.environ.get("ASR_POLL_TIMEOUT_SECONDS", "90"))
 ASR_POLL_INTERVAL_SECONDS = float(os.environ.get("ASR_POLL_INTERVAL_SECONDS", "1.5"))
+# Первая пауза после submit — типично ~10с на минуту аудио; для коротких
+# Telegram-голосовых хватает пары секунд.
+ASR_INITIAL_WAIT_SECONDS = float(os.environ.get("ASR_INITIAL_WAIT_SECONDS", "2.0"))
 
 # Общий сетевой таймаут одного HTTP-запроса.
 _HTTP_TIMEOUT_SECONDS = float(os.environ.get("ASR_HTTP_TIMEOUT_SECONDS", "30"))
@@ -175,6 +169,27 @@ def convert_ogg_if_needed(audio_path: str) -> str:
 # --------------------------------------------------------------------------
 
 
+def _is_not_ready_status(status: int, body: str) -> bool:
+    """getRecognition ещё не готов — нужно подождать и повторить."""
+    if status in (404, 409, 425, 429):
+        return True
+    if status == 400:
+        lower = (body or "").lower()
+        return any(
+            marker in lower
+            for marker in (
+                "not ready",
+                "not_ready",
+                "not found",
+                "not_found",
+                "failed_precondition",
+                "unavailable",
+                "try again",
+            )
+        )
+    return False
+
+
 async def _submit_recognition(session: aiohttp.ClientSession, audio_bytes: bytes) -> str:
     """recognizeFileAsync → возвращает operation_id.
 
@@ -192,10 +207,9 @@ async def _submit_recognition(session: aiohttp.ClientSession, audio_bytes: bytes
                 "profanityFilter": False,
                 "literatureText": False,
             },
-            # ru + kk: типичная речь бригадиров; auto — смешанные фразы.
             "languageRestriction": {
                 "restrictionType": "WHITELIST",
-                "languageCode": ["ru-RU", "kk-KK", "auto"],
+                "languageCode": ["ru-RU", "kk", "auto"],
             },
         },
     }
@@ -213,45 +227,57 @@ async def _submit_recognition(session: aiohttp.ClientSession, audio_bytes: bytes
     return operation_id
 
 
-async def _poll_operation(session: aiohttp.ClientSession, operation_id: str) -> dict:
+async def _wait_recognition_result(
+    session: aiohttp.ClientSession, operation_id: str
+) -> str:
     """
-    Опрашивает Operation до done=true либо до истечения ASR_POLL_TIMEOUT_SECONDS.
+    Опрашивает getRecognition до готовности результата.
 
-    URL: {OPERATION_SERVICE_URL}/operations/{id}
-    по умолчанию = {STT_SERVICE_URL}/operations/{id}.
+    Как в туториале KZ: после submit ждём и забираем результат через
+    getRecognition, без Operation.Get (тот для SpeechKit KZ отвечает 404).
     """
-    url = f"{OPERATION_SERVICE_URL}/operations/{operation_id}"
+    url = f"{STT_SERVICE_URL}/stt/v3/getRecognition"
+    params = {"operationId": operation_id, "operation_id": operation_id}
     deadline = time.monotonic() + ASR_POLL_TIMEOUT_SECONDS
 
-    while True:
-        async with session.get(url, headers=_auth_headers()) as resp:
-            await _raise_for_status(resp)
-            data = await resp.json()
+    await asyncio.sleep(ASR_INITIAL_WAIT_SECONDS)
 
-        if data.get("done"):
-            error = data.get("error")
-            if error:
-                raise YandexSpeechKitError(
-                    f"Операция распознавания завершилась ошибкой: {json.dumps(error)[:300]}"
+    last_status = None
+    last_body = ""
+    while time.monotonic() < deadline:
+        async with session.get(url, params=params, headers=_auth_headers()) as resp:
+            last_status = resp.status
+            last_body = await resp.text()
+
+            if 200 <= resp.status < 300:
+                if last_body.strip():
+                    return last_body
+                # Пустое тело — ещё рано или тишина; подождём ещё немного.
+                logger.debug("getRecognition 200 but empty body, retry")
+            elif resp.status in (401, 403):
+                await _raise_for_status(resp)
+            elif _is_not_ready_status(resp.status, last_body):
+                logger.debug(
+                    "getRecognition not ready yet: HTTP %s body[:200]=%r",
+                    resp.status,
+                    last_body[:200],
                 )
-            return data
-
-        if time.monotonic() >= deadline:
-            raise TimeoutError(
-                "Yandex SpeechKit: превышено время ожидания распознавания"
-            )
+            else:
+                logger.error(
+                    "Yandex SpeechKit getRecognition HTTP %s: %s",
+                    resp.status,
+                    last_body[:500],
+                )
+                raise YandexSpeechKitError(
+                    f"HTTP {resp.status}: {last_body[:500]}"
+                )
 
         await asyncio.sleep(ASR_POLL_INTERVAL_SECONDS)
 
-
-async def _fetch_recognition(session: aiohttp.ClientSession, operation_id: str) -> str:
-    """getRecognition → сырой текст ответа (поток StreamingResponse-объектов)."""
-    url = f"{STT_SERVICE_URL}/stt/v3/getRecognition"
-    # REST-справка: operationId; туториал KZ: operation_id — шлём оба.
-    params = {"operationId": operation_id, "operation_id": operation_id}
-    async with session.get(url, params=params, headers=_auth_headers()) as resp:
-        await _raise_for_status(resp)
-        return await resp.text()
+    raise TimeoutError(
+        "Yandex SpeechKit: превышено время ожидания распознавания "
+        f"(last HTTP {last_status}: {last_body[:200]})"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -409,9 +435,7 @@ async def transcribe(audio_path: str, language_hint: str = "mixed") -> str:
     async with aiohttp.ClientSession(timeout=timeout) as session:
         operation_id = await _submit_recognition(session, audio_bytes)
         logger.info("SpeechKit operation_id=%s, audio_bytes=%d", operation_id, len(audio_bytes))
-
-        await _poll_operation(session, operation_id)
-        raw_result = await _fetch_recognition(session, operation_id)
+        raw_result = await _wait_recognition_result(session, operation_id)
 
     transcript, languages = _extract_transcript(raw_result)
 
