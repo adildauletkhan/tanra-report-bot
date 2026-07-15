@@ -172,6 +172,24 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
         )
 
 
+def _invite_error_message(exc: IeAionBackendError) -> str:
+    """Человекочитаемое сообщение для ошибок привязки по invite-коду."""
+    detail = (exc.detail or "").lower()
+    if exc.status == 409:
+        if "already linked" in detail:
+            return (
+                "Этот Telegram уже привязан к другому бригадиру. "
+                "Обратитесь к ПТО, чтобы снять старую привязку."
+            )
+        return (
+            "Код приглашения недействителен или уже использован. "
+            "Попросите у ПТО новый код."
+        )
+    if exc.status == 401:
+        return "Ошибка доступа к сервису (API-ключ). Сообщите администратору."
+    return BACKEND_UNAVAILABLE_MSG
+
+
 async def _handle_invite(message: Message, telegram_user_id: int, invite_code: str) -> None:
     try:
         foreman = await ie_aion_client.find_foreman_by_invite(invite_code)
@@ -181,12 +199,21 @@ async def _handle_invite(message: Message, telegram_user_id: int, invite_code: s
             )
             return
 
+        if not isinstance(foreman, dict) or not foreman.get("foreman_id"):
+            logger.error("Unexpected by-invite payload: %r", foreman)
+            await message.answer(BACKEND_UNAVAILABLE_MSG)
+            return
+
         linked = await ie_aion_client.link_foreman_telegram(
             foreman["foreman_id"], telegram_user_id, invite_code
         )
-    except IeAionBackendError:
-        await message.answer(BACKEND_UNAVAILABLE_MSG)
+    except IeAionBackendError as exc:
+        logger.error("Invite link failed for code=%s: %s", invite_code, exc)
+        await message.answer(_invite_error_message(exc))
         return
+
+    if not isinstance(linked, dict):
+        linked = {}
 
     session = ForemanSession(
         telegram_user_id=telegram_user_id,

@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 
@@ -27,7 +28,12 @@ _HTTP_TIMEOUT_SECONDS = float(os.environ.get("IE_AION_HTTP_TIMEOUT_SECONDS", "20
 
 
 class IeAionBackendError(Exception):
-    """Ошибка обращения к backend IE:AION (сеть/таймаут/5xx/невалидный ответ)."""
+    """Ошибка обращения к backend IE:AION (сеть/таймаут/4xx/5xx/невалидный ответ)."""
+
+    def __init__(self, message: str, *, status: int | None = None, detail: str | None = None):
+        super().__init__(message)
+        self.status = status
+        self.detail = detail
 
 
 def ensure_config() -> None:
@@ -49,27 +55,58 @@ def ensure_config() -> None:
 
 
 def _headers() -> dict[str, str]:
-    return {"X-Bot-Api-Key": BOT_BACKEND_API_KEY}
+    return {"X-Bot-Api-Key": BOT_BACKEND_API_KEY, "Accept": "application/json"}
 
 
 def _url(path: str) -> str:
     return f"{IE_AION_BACKEND_URL}{path}"
 
 
-async def _request(method: str, path: str, *, json: dict | None = None, allow_404: bool = False):
+def _parse_detail(body: str) -> str | None:
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return body[:300] if body else None
+    if isinstance(data, dict):
+        detail = data.get("detail")
+        if isinstance(detail, str):
+            return detail
+        if detail is not None:
+            return str(detail)[:300]
+    return body[:300] if body else None
+
+
+async def _request(method: str, path: str, *, json_body: dict | None = None, allow_404: bool = False):
     timeout = aiohttp.ClientTimeout(total=_HTTP_TIMEOUT_SECONDS)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.request(method, _url(path), json=json, headers=_headers()) as resp:
+            async with session.request(
+                method, _url(path), json=json_body, headers=_headers()
+            ) as resp:
+                body = await resp.text()
                 if resp.status == 404 and allow_404:
                     return None
-                body = await resp.text()
                 if resp.status >= 400:
-                    logger.error("IE:AION backend %s %s -> HTTP %s: %s", method, path, resp.status, body[:300])
-                    raise IeAionBackendError(f"HTTP {resp.status}: {body[:300]}")
+                    detail = _parse_detail(body)
+                    logger.error(
+                        "IE:AION backend %s %s -> HTTP %s: %s",
+                        method, path, resp.status, (body or "")[:300],
+                    )
+                    raise IeAionBackendError(
+                        f"HTTP {resp.status}: {(body or '')[:300]}",
+                        status=resp.status,
+                        detail=detail,
+                    )
                 if not body:
                     return None
-                return await resp.json() if resp.content_type == "application/json" else body
+                try:
+                    return json.loads(body)
+                except json.JSONDecodeError as exc:
+                    logger.error("IE:AION backend invalid JSON %s %s: %s", method, path, body[:200])
+                    raise IeAionBackendError(
+                        "Невалидный JSON от backend IE:AION",
+                        status=resp.status,
+                    ) from exc
     except aiohttp.ClientError as exc:
         logger.error("IE:AION backend network error %s %s: %s", method, path, exc)
         raise IeAionBackendError(f"Сетевая ошибка при обращении к backend: {exc}") from exc
@@ -114,7 +151,9 @@ async def submit_journal_entries(
         "raw_quote": raw_quote,
         "report_date": report_date,
     }
-    result = await _request("POST", f"/api/construction/projects/{project_id}/journal", json=payload)
+    result = await _request(
+        "POST", f"/api/construction/projects/{project_id}/journal", json_body=payload
+    )
     return result or {}
 
 
@@ -141,6 +180,6 @@ async def link_foreman_telegram(foreman_id: str, telegram_user_id: int, invite_c
     """Привязать Telegram-аккаунт к бригадиру (проверяет соответствие invite_code)."""
     payload = {"telegram_user_id": telegram_user_id, "invite_code": invite_code}
     result = await _request(
-        "POST", f"/api/construction/foremen/{foreman_id}/link-telegram", json=payload
+        "POST", f"/api/construction/foremen/{foreman_id}/link-telegram", json_body=payload
     )
     return result or {}
