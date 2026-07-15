@@ -419,13 +419,11 @@ async def process_report(
     except Exception as exc:
         # llm_claude.structure сам ловит API-ошибки; сюда попадаем редко.
         logger.exception("LLM structuring failed: %s", exc)
-        structured = {
-            "entries": [],
-            "needs_clarification": [
-                {"reason": f"structure_exception:{type(exc).__name__}", "raw_fragment": transcript[:200]}
-            ],
-            "summary_line": f"Распознано (черновик без структуры):\n{transcript.strip()[:500]}",
-        }
+        structured = llm_claude.fallback_structure(
+            transcript,
+            f"structure_exception:{type(exc).__name__}",
+            session.default_zone,
+        )
 
     report = VoiceReportLog(
         report_id=f"r-{datetime.utcnow().timestamp()}",
@@ -526,12 +524,25 @@ async def on_confirm(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     report.confirmed = True
-    applied = result.get("applied_count", len(entries))
-    clarify = result.get("clarification_count", 0)
-    tail = f" ({clarify} в очереди верификации ПТО)" if clarify else ""
-    await callback.message.edit_text(
-        f"✅ Отчёт записан в суточный журнал: {applied} записей{tail}."
-    )
+    applied = int(result.get("applied_count") or 0)
+    clarify = int(result.get("clarification_count") or 0)
+    total = applied + clarify
+    if total == 0:
+        await callback.message.edit_text(
+            "⚠ Отчёт подтверждён, но в журнал не попало ни одной записи "
+            "(пустой разбор). Отправьте голосовое ещё раз или уточните зону/работу."
+        )
+    elif applied == 0 and clarify > 0:
+        await callback.message.edit_text(
+            f"✅ Отчёт принят: {clarify} запис. в очереди верификации ПТО "
+            f"(привязка к WBS требует уточнения).\n"
+            f"Текст: {(report.raw_transcript or '')[:300]}"
+        )
+    else:
+        tail = f", {clarify} в очереди верификации ПТО" if clarify else ""
+        await callback.message.edit_text(
+            f"✅ Отчёт записан в суточный журнал: {applied} применённых записей{tail}."
+        )
     await callback.answer()
     await state.clear()
 

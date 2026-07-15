@@ -139,13 +139,38 @@ def _summary_line(structured: dict) -> str:
     return "\n".join(parts)
 
 
-def _fallback(transcript: str, reason: str) -> dict:
+def _synthetic_entry(
+    transcript: str, default_zone_hint: str | None, reason: str
+) -> dict:
+    """Минимальная запись для журнала, когда LLM не смог разобрать отчёт."""
+    return {
+        "task_id": None,
+        "wbs_code": None,
+        "zone": default_zone_hint,
+        "work_type": "голосовой отчёт",
+        "match_confidence": "no_context",
+        "plan_pct": None,
+        "fact_pct": None,
+        "delta_pct": None,
+        "blocker": {"type": "none", "description": None},
+        "risk": {"severity": "none", "delay_days": None, "description": None},
+        "responsible": None,
+        "recommended_actions": [],
+        "notes": (transcript or "").strip()[:1000] or reason,
+    }
+
+
+def fallback_structure(
+    transcript: str, reason: str, default_zone_hint: str | None = None
+) -> dict:
+    """Публичный fallback: всегда ≥1 entry, чтобы журнал не оставался пустым."""
     snippet = (transcript or "").strip()
     if len(snippet) > 500:
         snippet = snippet[:497] + "…"
+    entry = _synthetic_entry(transcript, default_zone_hint, reason)
     return {
-        "entries": [],
-        "needs_clarification": [{"reason": reason, "raw_fragment": transcript[:200]}],
+        "entries": [entry],
+        "needs_clarification": [{"reason": reason, "raw_fragment": (transcript or "")[:200]}],
         "summary_line": f"Распознано (черновик без структуры):\n{snippet}",
     }
 
@@ -177,17 +202,35 @@ async def structure(
             structured = _parse(raw)
     except APIError as exc:
         logger.exception("Anthropic API error (model=%s): %s", CLAUDE_MODEL, exc)
-        return _fallback(transcript, f"anthropic_api_error:{getattr(exc, 'status_code', '?')}")
+        return fallback_structure(
+            transcript,
+            f"anthropic_api_error:{getattr(exc, 'status_code', '?')}",
+            default_zone_hint,
+        )
     except Exception as exc:
         logger.exception("Claude structure unexpected error: %s", exc)
-        return _fallback(transcript, f"structure_error:{type(exc).__name__}")
+        return fallback_structure(
+            transcript, f"structure_error:{type(exc).__name__}", default_zone_hint
+        )
 
     if structured is None:
         logger.error("Claude не вернул валидный JSON после повторной попытки")
-        return _fallback(transcript, "parse_error")
+        return fallback_structure(transcript, "parse_error", default_zone_hint)
 
     structured.setdefault("entries", [])
     structured.setdefault("needs_clarification", [])
+
+    # Claude иногда возвращает валидный JSON, но с пустым entries[] — не даём
+    # подтвердить «пустой» отчёт: кладём синтетическую запись в очередь ПТО.
+    if not structured["entries"] and (transcript or "").strip():
+        logger.warning("Claude вернул пустой entries[], добавляем synthetic entry")
+        structured["entries"] = [
+            _synthetic_entry(transcript, default_zone_hint, "empty_entries")
+        ]
+        structured["needs_clarification"].append(
+            {"reason": "empty_entries", "raw_fragment": transcript[:200]}
+        )
+
     structured["summary_line"] = _summary_line(structured)
 
     entries = structured["entries"]
