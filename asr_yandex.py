@@ -123,7 +123,7 @@ def _auth_headers() -> dict[str, str]:
 
 
 async def _raise_for_status(resp: aiohttp.ClientResponse) -> None:
-    if resp.status == 200:
+    if 200 <= resp.status < 300:
         return
 
     body = await resp.text()
@@ -169,26 +169,28 @@ def convert_ogg_if_needed(audio_path: str) -> str:
 
 
 async def _submit_recognition(session: aiohttp.ClientSession, audio_bytes: bytes) -> str:
-    """recognizeFileAsync → возвращает operation_id."""
+    """recognizeFileAsync → возвращает operation_id.
+
+    Тело в snake_case — как в официальных примерах KZ API
+    (https://yandex.cloud/ru-kz/docs/speechkit/stt/api/transcribation-api-v3).
+    """
     payload = {
         "content": base64.b64encode(audio_bytes).decode("ascii"),
-        "recognitionModel": {
+        "recognition_model": {
             "model": "general",
-            "audioFormat": {
-                "containerAudio": {"containerAudioType": "OGG_OPUS"},
+            "audio_format": {
+                "container_audio": {"container_audio_type": "OGG_OPUS"},
             },
-            "textNormalization": {
-                "textNormalization": "TEXT_NORMALIZATION_ENABLED",
-                "profanityFilter": False,
-                "literatureText": False,
+            "text_normalization": {
+                "text_normalization": "TEXT_NORMALIZATION_ENABLED",
+                "profanity_filter": False,
+                "literature_text": False,
             },
-            # WHITELIST + ["auto"] — автоопределение языка по каждому предложению
-            # (ru/kk и смешанные фразы бригадиров).
-            "languageRestriction": {
-                "restrictionType": "WHITELIST",
-                "languageCode": ["auto"],
+            # ru + kk: типичная речь бригадиров; auto — смешанные фразы.
+            "language_restriction": {
+                "restriction_type": "WHITELIST",
+                "language_code": ["ru-RU", "kk-KK", "auto"],
             },
-            "audioProcessingType": "FULL_DATA",
         },
     }
 
@@ -235,11 +237,14 @@ async def _poll_operation(session: aiohttp.ClientSession, operation_id: str) -> 
 
 
 async def _fetch_recognition(session: aiohttp.ClientSession, operation_id: str) -> str:
-    """getRecognition → сырой текст ответа (поток StreamingResponse-объектов)."""
+    """getRecognition → сырой текст ответа (поток StreamingResponse-объектов).
+
+    В туториале KZ — query `operation_id`, в REST-справке — `operationId`.
+    Передаём оба, чтобы не зависеть от версии gateway.
+    """
     url = f"{STT_SERVICE_URL}/stt/v3/getRecognition"
-    async with session.get(
-        url, params={"operationId": operation_id}, headers=_auth_headers()
-    ) as resp:
+    params = {"operation_id": operation_id, "operationId": operation_id}
+    async with session.get(url, params=params, headers=_auth_headers()) as resp:
         await _raise_for_status(resp)
         return await resp.text()
 
@@ -286,19 +291,29 @@ def _iter_stream_objects(raw_text: str):
         idx = end
 
 
+def _confidence_value(alt: dict) -> float:
+    raw = alt.get("confidence")
+    if raw is None or raw == "":
+        return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _best_alternative(alternative_update: dict) -> tuple[str, list[str]]:
     """Из AlternativeUpdate берём альтернативу с максимальным confidence."""
     alternatives = alternative_update.get("alternatives") or []
     if not alternatives:
         return "", []
 
-    best = max(alternatives, key=lambda alt: alt.get("confidence") or 0)
+    best = max(alternatives, key=_confidence_value)
     text = (best.get("text") or "").strip()
-    languages = [
-        lang.get("languageCode")
-        for lang in (best.get("languages") or [])
-        if lang.get("languageCode")
-    ]
+    languages = []
+    for lang in best.get("languages") or []:
+        code = lang.get("languageCode") or lang.get("language_code")
+        if code:
+            languages.append(code)
     return text, languages
 
 
@@ -319,14 +334,22 @@ def _extract_transcript(raw_text: str) -> tuple[str, list[str]]:
         if not isinstance(event, dict):
             continue
 
-        if "finalRefinement" in event:
-            normalized = event["finalRefinement"].get("normalizedText") or {}
+        refinement = event.get("finalRefinement") or event.get("final_refinement")
+        if refinement:
+            normalized = (
+                refinement.get("normalizedText")
+                or refinement.get("normalized_text")
+                or {}
+            )
             text, langs = _best_alternative(normalized)
             if text:
                 refined_segments.append(text)
             languages.extend(langs)
-        elif "final" in event:
-            text, langs = _best_alternative(event["final"])
+            continue
+
+        final = event.get("final")
+        if final:
+            text, langs = _best_alternative(final)
             if text:
                 final_segments.append(text)
             languages.extend(langs)
@@ -370,11 +393,17 @@ async def transcribe(audio_path: str, language_hint: str = "mixed") -> str:
         )
 
     started = time.monotonic()
-    timeout = aiohttp.ClientTimeout(total=_HTTP_TIMEOUT_SECONDS)
+    # sock_read отдельно: upload/base64 и длинный getRecognition не должны
+    # укладываться в короткий total на весь session.
+    timeout = aiohttp.ClientTimeout(
+        total=None,
+        sock_connect=min(15.0, _HTTP_TIMEOUT_SECONDS),
+        sock_read=max(_HTTP_TIMEOUT_SECONDS, ASR_POLL_TIMEOUT_SECONDS),
+    )
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         operation_id = await _submit_recognition(session, audio_bytes)
-        logger.debug("SpeechKit operation_id=%s", operation_id)
+        logger.info("SpeechKit operation_id=%s, audio_bytes=%d", operation_id, len(audio_bytes))
 
         await _poll_operation(session, operation_id)
         raw_result = await _fetch_recognition(session, operation_id)
@@ -388,7 +417,12 @@ async def transcribe(audio_path: str, language_hint: str = "mixed") -> str:
         len(transcript),
         ",".join(languages) if languages else "n/a",
     )
-    # Сырой текст транскрипта — только на debug (как для llm_structure).
-    logger.debug("SpeechKit transcript: %s", transcript)
+    if not transcript:
+        logger.warning(
+            "SpeechKit: пустой транскрипт, raw[:500]=%r",
+            (raw_result or "")[:500],
+        )
+    else:
+        logger.debug("SpeechKit transcript: %s", transcript)
 
     return transcript

@@ -35,8 +35,13 @@ from aiogram.types import (
 
 import ie_aion_client
 import llm_claude
-from asr_yandex import ensure_config as ensure_yandex_config
-from asr_yandex import transcribe as asr_transcribe
+from asr_yandex import (
+    YandexSpeechKitAuthError,
+    YandexSpeechKitError,
+    YandexSpeechKitRateLimitError,
+    ensure_config as ensure_yandex_config,
+    transcribe as asr_transcribe,
+)
 from ie_aion_client import IeAionBackendError
 
 logging.basicConfig(level=logging.INFO)
@@ -337,15 +342,43 @@ async def _structure_transcript(session: ForemanSession, transcript: str) -> dic
 async def process_report(
     bot: Bot, message: Message, state: FSMContext, audio_path: str
 ) -> None:
-    session = await resolve_foreman(message.from_user.id)
+    try:
+        session = await resolve_foreman(message.from_user.id)
+    except IeAionBackendError:
+        await message.answer(BACKEND_UNAVAILABLE_MSG)
+        await state.clear()
+        return
+
     if session is None:
         await message.answer("Сначала зарегистрируйтесь: /start <код приглашения>")
         await state.clear()
         return
 
-    await message.answer("⏳ Обрабатываю...")
+    await message.answer("⏳ Обрабатываю голосовое...")
 
-    transcript = await asr_transcribe(audio_path, language_hint="mixed")
+    try:
+        transcript = await asr_transcribe(audio_path, language_hint="mixed")
+    except YandexSpeechKitAuthError:
+        logger.exception("SpeechKit auth error")
+        await message.answer(
+            "Распознавание речи недоступно: ошибка доступа к SpeechKit. "
+            "Сообщите администратору (ключ/роль ai.speechkit-stt.user)."
+        )
+        await state.clear()
+        return
+    except YandexSpeechKitRateLimitError:
+        logger.exception("SpeechKit rate limit")
+        await message.answer("Сервис распознавания перегружен, попробуйте через минуту.")
+        await state.clear()
+        return
+    except (YandexSpeechKitError, TimeoutError, OSError) as exc:
+        logger.exception("SpeechKit failed: %s", exc)
+        await message.answer(
+            "Не удалось распознать речь (ошибка сервиса). Попробуйте ещё раз чуть позже."
+        )
+        await state.clear()
+        return
+
     if not transcript.strip():
         await message.answer(
             "Не удалось распознать речь, попробуйте ещё раз в тихом месте."
@@ -353,7 +386,15 @@ async def process_report(
         await state.clear()
         return
 
-    structured = await _structure_transcript(session, transcript)
+    try:
+        structured = await _structure_transcript(session, transcript)
+    except Exception:
+        logger.exception("LLM structuring failed")
+        await message.answer(
+            "Речь распознана, но не удалось сформировать черновик. Попробуйте ещё раз."
+        )
+        await state.clear()
+        return
 
     report = VoiceReportLog(
         report_id=f"r-{datetime.utcnow().timestamp()}",
@@ -392,7 +433,12 @@ async def handle_voice_default(message: Message, state: FSMContext, bot: Bot) ->
     if current_state == ReportFlow.waiting_correction.state:
         return  # обработается отдельным хендлером
 
-    session = await resolve_foreman(message.from_user.id)
+    try:
+        session = await resolve_foreman(message.from_user.id)
+    except IeAionBackendError:
+        await message.answer(BACKEND_UNAVAILABLE_MSG)
+        return
+
     if session is None:
         await message.answer("Сначала зарегистрируйтесь: /start <код приглашения>")
         return
@@ -502,7 +548,12 @@ async def _reprocess_correction(message: Message, state: FSMContext, correction_
 @router.message(ReportFlow.waiting_correction, F.voice)
 async def handle_correction_voice(message: Message, state: FSMContext, bot: Bot) -> None:
     audio_path = await download_voice(bot, message)
-    correction_text = await asr_transcribe(audio_path, language_hint="mixed")
+    try:
+        correction_text = await asr_transcribe(audio_path, language_hint="mixed")
+    except (YandexSpeechKitError, TimeoutError, OSError) as exc:
+        logger.exception("SpeechKit correction failed: %s", exc)
+        await message.answer("Не удалось распознать исправление (ошибка сервиса). Попробуйте ещё раз.")
+        return
     if not correction_text.strip():
         await message.answer("Не удалось распознать исправление, попробуйте ещё раз.")
         return
