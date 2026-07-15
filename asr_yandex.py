@@ -12,7 +12,10 @@ ASR через Yandex SpeechKit — AsyncRecognizer, API v3 REST (регион �
 Поток работы (см. https://yandex.cloud/ru-kz/docs/speechkit/stt-v3):
     1. POST /stt/v3/recognizeFileAsync — отправляем аудио (inline base64) и получаем
        operation_id (Long Running Operation).
-    2. Опрашиваем Operation service до done=true (_poll_operation).
+    2. Опрашиваем GET {STT}/operations/{id} до done=true (_poll_operation).
+       Важно: для SpeechKit KZ операции живут на том же хосте STT
+       (stt.api.ml.yandexcloud.kz), а не на operation.api.* — тот хост
+       в регионе KZ не резолвится.
     3. GET /stt/v3/getRecognition?operationId=... — забираем результат (поток
        StreamingResponse-объектов) и склеиваем транскрипт.
 
@@ -51,9 +54,13 @@ YANDEX_FOLDER_ID = os.environ.get("YANDEX_FOLDER_ID")
 STT_SERVICE_URL = os.environ.get(
     "YANDEX_STT_SERVICE_URL", "https://stt.api.ml.yandexcloud.kz"
 ).rstrip("/")
-OPERATION_SERVICE_URL = os.environ.get(
-    "YANDEX_OPERATION_SERVICE_URL", "https://operation.api.ml.yandexcloud.kz"
-).rstrip("/")
+# REST Operation.Get: GET https://stt.api.ml.yandexcloud.kz/operations/{operationId}
+# Хост operation.api.ml.yandexcloud.kz в KZ не резолвится — игнорируем, если задан.
+_op_override = os.environ.get("YANDEX_OPERATION_SERVICE_URL", "").rstrip("/")
+if _op_override and "operation.api.ml.yandexcloud.kz" not in _op_override:
+    OPERATION_SERVICE_URL = _op_override
+else:
+    OPERATION_SERVICE_URL = STT_SERVICE_URL
 
 # Параметры опроса операции распознавания.
 ASR_POLL_TIMEOUT_SECONDS = float(os.environ.get("ASR_POLL_TIMEOUT_SECONDS", "60"))
@@ -171,25 +178,24 @@ def convert_ogg_if_needed(audio_path: str) -> str:
 async def _submit_recognition(session: aiohttp.ClientSession, audio_bytes: bytes) -> str:
     """recognizeFileAsync → возвращает operation_id.
 
-    Тело в snake_case — как в официальных примерах KZ API
-    (https://yandex.cloud/ru-kz/docs/speechkit/stt/api/transcribation-api-v3).
+    Тело в camelCase — как в REST OpenAPI SpeechKit v3 KZ.
     """
     payload = {
         "content": base64.b64encode(audio_bytes).decode("ascii"),
-        "recognition_model": {
+        "recognitionModel": {
             "model": "general",
-            "audio_format": {
-                "container_audio": {"container_audio_type": "OGG_OPUS"},
+            "audioFormat": {
+                "containerAudio": {"containerAudioType": "OGG_OPUS"},
             },
-            "text_normalization": {
-                "text_normalization": "TEXT_NORMALIZATION_ENABLED",
-                "profanity_filter": False,
-                "literature_text": False,
+            "textNormalization": {
+                "textNormalization": "TEXT_NORMALIZATION_ENABLED",
+                "profanityFilter": False,
+                "literatureText": False,
             },
             # ru + kk: типичная речь бригадиров; auto — смешанные фразы.
-            "language_restriction": {
-                "restriction_type": "WHITELIST",
-                "language_code": ["ru-RU", "kk-KK", "auto"],
+            "languageRestriction": {
+                "restrictionType": "WHITELIST",
+                "languageCode": ["ru-RU", "kk-KK", "auto"],
             },
         },
     }
@@ -209,8 +215,10 @@ async def _submit_recognition(session: aiohttp.ClientSession, audio_bytes: bytes
 
 async def _poll_operation(session: aiohttp.ClientSession, operation_id: str) -> dict:
     """
-    Опрашивает Operation service до done=true либо до истечения
-    ASR_POLL_TIMEOUT_SECONDS. Возвращает финальный объект операции.
+    Опрашивает Operation до done=true либо до истечения ASR_POLL_TIMEOUT_SECONDS.
+
+    URL: {OPERATION_SERVICE_URL}/operations/{id}
+    по умолчанию = {STT_SERVICE_URL}/operations/{id}.
     """
     url = f"{OPERATION_SERVICE_URL}/operations/{operation_id}"
     deadline = time.monotonic() + ASR_POLL_TIMEOUT_SECONDS
@@ -237,13 +245,10 @@ async def _poll_operation(session: aiohttp.ClientSession, operation_id: str) -> 
 
 
 async def _fetch_recognition(session: aiohttp.ClientSession, operation_id: str) -> str:
-    """getRecognition → сырой текст ответа (поток StreamingResponse-объектов).
-
-    В туториале KZ — query `operation_id`, в REST-справке — `operationId`.
-    Передаём оба, чтобы не зависеть от версии gateway.
-    """
+    """getRecognition → сырой текст ответа (поток StreamingResponse-объектов)."""
     url = f"{STT_SERVICE_URL}/stt/v3/getRecognition"
-    params = {"operation_id": operation_id, "operationId": operation_id}
+    # REST-справка: operationId; туториал KZ: operation_id — шлём оба.
+    params = {"operationId": operation_id, "operation_id": operation_id}
     async with session.get(url, params=params, headers=_auth_headers()) as resp:
         await _raise_for_status(resp)
         return await resp.text()

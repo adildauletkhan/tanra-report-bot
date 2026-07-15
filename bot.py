@@ -373,8 +373,12 @@ async def process_report(
         return
     except (YandexSpeechKitError, TimeoutError, OSError) as exc:
         logger.exception("SpeechKit failed: %s", exc)
+        hint = str(exc).strip()
+        if len(hint) > 160:
+            hint = hint[:157] + "…"
         await message.answer(
             "Не удалось распознать речь (ошибка сервиса). Попробуйте ещё раз чуть позже."
+            + (f"\n\nТехническая деталь: {hint}" if hint else "")
         )
         await state.clear()
         return
