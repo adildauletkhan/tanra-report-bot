@@ -314,9 +314,33 @@ async def cmd_record(message: Message, state: FSMContext) -> None:
 
 
 async def download_voice(bot: Bot, message: Message) -> str:
-    file = await bot.get_file(message.voice.file_id)
-    local_path = f"/tmp/{message.voice.file_id}.ogg"
-    await bot.download_file(file.file_path, local_path)
+    """Скачивает Telegram voice (.ogg/opus) во временный файл."""
+    import tempfile
+    from pathlib import Path
+
+    voice = message.voice
+    if voice is None:
+        raise ValueError("Сообщение не содержит голосового")
+
+    # Безопасное имя: file_unique_id короче и без странных символов.
+    suffix = f"{voice.file_unique_id}.ogg"
+    local_path = str(Path(tempfile.gettempdir()) / f"tg-voice-{suffix}")
+
+    if hasattr(bot, "download"):
+        await bot.download(voice, destination=local_path)
+    else:
+        file = await bot.get_file(voice.file_id)
+        await bot.download_file(file.file_path, local_path)
+
+    size = Path(local_path).stat().st_size
+    if size < 64:
+        raise ValueError(f"Голосовой файл слишком маленький или пустой ({size} байт)")
+    logger.info(
+        "Voice downloaded: path=%s size=%d duration=%s",
+        local_path,
+        size,
+        getattr(voice, "duration", None),
+    )
     return local_path
 
 
@@ -371,11 +395,11 @@ async def process_report(
         await message.answer("Сервис распознавания перегружен, попробуйте через минуту.")
         await state.clear()
         return
-    except (YandexSpeechKitError, TimeoutError, OSError) as exc:
+    except (YandexSpeechKitError, TimeoutError, OSError, ValueError) as exc:
         logger.exception("SpeechKit failed: %s", exc)
         hint = str(exc).strip()
-        if len(hint) > 160:
-            hint = hint[:157] + "…"
+        if len(hint) > 280:
+            hint = hint[:277] + "…"
         await message.answer(
             "Не удалось распознать речь (ошибка сервиса). Попробуйте ещё раз чуть позже."
             + (f"\n\nТехническая деталь: {hint}" if hint else "")

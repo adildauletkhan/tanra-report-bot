@@ -175,6 +175,9 @@ def _is_not_ready_status(status: int, body: str) -> bool:
         return True
     if status == 400:
         lower = (body or "").lower()
+        # INVALID_ARGUMENT / "Error in session" — это финальный сбой, не «ещё не готово».
+        if "error in session" in lower or "invalid" in lower or '"grpcCode":3' in body or '"grpcCode": 3' in body:
+            return False
         return any(
             marker in lower
             for marker in (
@@ -207,9 +210,11 @@ async def _submit_recognition(session: aiohttp.ClientSession, audio_bytes: bytes
                 "profanityFilter": False,
                 "literatureText": False,
             },
+            # Коды строго из таблицы SpeechKit KZ (kk-KZ, не kk).
+            # Список языков как подсказка точнее, чем один только auto.
             "languageRestriction": {
                 "restrictionType": "WHITELIST",
-                "languageCode": ["ru-RU", "kk", "auto"],
+                "languageCode": ["ru-RU", "kk-KZ"],
             },
         },
     }
